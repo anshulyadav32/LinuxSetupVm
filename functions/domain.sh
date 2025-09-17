@@ -1,4 +1,3 @@
-
 #!/bin/bash
 # ============================================================
 # Setup a Domain with Nginx + SSL + Readiness Check
