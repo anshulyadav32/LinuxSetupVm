@@ -12,8 +12,9 @@ DEFAULT_PUBLIC_IP4=$(curl -s -4 ifconfig.me || echo "")
 DEFAULT_PUBLIC_IP6=$(curl -s -6 ifconfig.me || echo "")
 DEFAULT_HOSTNAME=$(hostname -f 2>/dev/null || hostname)
 
-PG_HBA="/etc/postgresql/16/main/pg_hba.conf"
-PG_CONF="/etc/postgresql/16/main/postgresql.conf"
+# PostgreSQL paths will be set dynamically based on detected version
+PG_HBA=""
+PG_CONF=""
 SSL_DIR="/etc/ssl/postgresql"
 
 # ============================================================
@@ -107,6 +108,9 @@ update_pg_hba() {
   if [[ "$PUBLIC" =~ ^[Yy]$ ]]; then
     [[ -n "$PUBLIC_IP4" ]] && echo "hostssl all all $PUBLIC_IP4/32 md5" | sudo tee -a "$PG_HBA"
     [[ -n "$PUBLIC_IP6" ]] && echo "hostssl all all $PUBLIC_IP6/128 md5" | sudo tee -a "$PG_HBA"
+    # Allow connections from any IP for external access
+    echo "hostssl all all 0.0.0.0/0 md5" | sudo tee -a "$PG_HBA"
+    echo "hostssl all all ::/0 md5" | sudo tee -a "$PG_HBA"
   fi
 
   echo "hostssl all all ::1/128 md5" | sudo tee -a "$PG_HBA"
@@ -163,13 +167,52 @@ setup_domain_ssl() {
   fi
 
   # If we reached here, Let's Encrypt succeeded
+  # Fix SSL certificate permissions for PostgreSQL
+  sudo chmod 755 "/etc/letsencrypt/live"
+  sudo chmod 755 "/etc/letsencrypt/archive"
+  sudo chmod 755 "/etc/letsencrypt/live/$HOST1"
+  sudo chmod 755 "/etc/letsencrypt/archive/$HOST1"
+  sudo chmod 644 "/etc/letsencrypt/archive/$HOST1"/*.pem
+  sudo chmod 640 "/etc/letsencrypt/archive/$HOST1"/privkey*.pem
+  sudo chgrp postgres "/etc/letsencrypt/archive/$HOST1"/privkey*.pem
+  
+  # Enable SSL in PostgreSQL config
+  sudo sed -i "s|^#*ssl = .*|ssl = on|" "$PG_CONF"
   sudo sed -i "s|^#*ssl_cert_file.*|ssl_cert_file = '$CERT_PATH/fullchain.pem'|" "$PG_CONF"
   sudo sed -i "s|^#*ssl_key_file.*|ssl_key_file = '$CERT_PATH/privkey.pem'|" "$PG_CONF"
-  sudo systemctl restart postgresql
+  
+  # Enable external connections
+  sudo sed -i "s|^#*listen_addresses.*|listen_addresses = '*'|" "$PG_CONF"
+  
+  # Restart PostgreSQL service
+  sudo systemctl restart "$PG_SERVICE"
+  sleep 2
+  
+  # Check if PostgreSQL started successfully
+  if ! sudo systemctl is-active --quiet "$PG_SERVICE"; then
+    echo "❌ PostgreSQL failed to start with Let's Encrypt SSL. Check logs:"
+    sudo journalctl -u "$PG_SERVICE" -n 5 --no-pager
+    return 1
+  fi
 
   # Renewal hook
   sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-  echo "systemctl reload postgresql" | sudo tee /etc/letsencrypt/renewal-hooks/deploy/reload-postgres.sh >/dev/null
+  cat << 'EOF' | sudo tee /etc/letsencrypt/renewal-hooks/deploy/reload-postgres.sh >/dev/null
+#!/bin/bash
+# Fix parent directory permissions
+chmod 755 /etc/letsencrypt/live
+chmod 755 /etc/letsencrypt/archive
+
+for domain in /etc/letsencrypt/live/*/; do
+  domain_name=$(basename "$domain")
+  chmod 755 "/etc/letsencrypt/live/$domain_name"
+  chmod 755 "/etc/letsencrypt/archive/$domain_name"
+  chmod 644 "/etc/letsencrypt/live/$domain_name/fullchain.pem"
+  chmod 640 "/etc/letsencrypt/live/$domain_name/privkey.pem"
+  chgrp postgres "/etc/letsencrypt/live/$domain_name/privkey.pem"
+done
+systemctl reload postgresql@*-*
+EOF
   sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-postgres.sh
 
   USE_LE_SSL="yes"
@@ -189,16 +232,46 @@ generate_ssl() {
   sudo sed -i "s|^#*ssl = .*|ssl = on|" "$PG_CONF"
   sudo sed -i "s|^#*ssl_cert_file.*|ssl_cert_file = '$SSL_DIR/server.crt'|" "$PG_CONF"
   sudo sed -i "s|^#*ssl_key_file.*|ssl_key_file = '$SSL_DIR/server.key'|" "$PG_CONF"
+  
+  # Enable external connections
+  sudo sed -i "s|^#*listen_addresses.*|listen_addresses = '*'|" "$PG_CONF"
 
-  sudo systemctl restart postgresql
+  # Restart PostgreSQL service
+  sudo systemctl restart "$PG_SERVICE"
+  sleep 2
+  
+  # Check if PostgreSQL started successfully
+  if ! sudo systemctl is-active --quiet "$PG_SERVICE"; then
+    echo "❌ PostgreSQL failed to start with self-signed SSL. Check logs:"
+    sudo journalctl -u "$PG_SERVICE" -n 5 --no-pager
+    return 1
+  fi
+  
   SSL_TYPE="Self-signed"
 }
 
 create_user_db() {
   echo "👤 Creating user and database..."
+  
+  # Ensure PostgreSQL is running before attempting database operations
+  if ! sudo systemctl is-active --quiet "$PG_SERVICE"; then
+    echo "⚠️ PostgreSQL is not running. Attempting to start..."
+    sudo systemctl start "$PG_SERVICE"
+    sleep 3
+    
+    if ! sudo systemctl is-active --quiet "$PG_SERVICE"; then
+      echo "❌ Failed to start PostgreSQL. Check the service status:"
+      sudo systemctl status "$PG_SERVICE" --no-pager -l
+      exit 1
+    fi
+    echo "✅ PostgreSQL started successfully"
+  fi
+  
+  # Create user if it doesn't exist
   sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='$DBUSER'" | grep -q 1 || \
     sudo -u postgres psql -c "CREATE USER $DBUSER WITH PASSWORD '$DBPASS';"
 
+  # Create database if it doesn't exist
   sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DBNAME" || \
     sudo -u postgres createdb "$DBNAME" -O "$DBUSER"
 }
@@ -215,6 +288,7 @@ PUBLIC_IP4=$PUBLIC_IP4
 PUBLIC_IP6=$PUBLIC_IP6
 HOST1=$HOST1
 HOST2=$HOST2
+PUBLIC=$PUBLIC
 CREDFILE
   chmod 600 "$HOME/.db_cred"
   echo "✅ Credentials saved at $HOME/.db_cred"
@@ -257,8 +331,11 @@ test_all_connectivity() {
   for TARGET in "127.0.0.1" "$PRIVATE_IP" "$PUBLIC_IP4" "$PUBLIC_IP6" "$HOST1" "$HOST2"; do
     [[ -z "$TARGET" ]] && continue
     echo -n "Testing DB connection to $TARGET ... "
-    timeout 5 PGPASSWORD=$DBPASS psql -h "$TARGET" -U "$DBUSER" -d "$DBNAME" -c "\q" >/dev/null 2>&1 \
-      && echo "✅ OK" || echo "❌ FAILED"
+    if timeout 10 bash -c "PGPASSWORD='$DBPASS' psql -h '$TARGET' -U '$DBUSER' -d '$DBNAME' -c '\q' >/dev/null 2>&1"; then
+      echo "✅ OK"
+    else
+      echo "❌ FAILED"
+    fi
   done
 }
 
@@ -267,6 +344,33 @@ test_all_connectivity() {
 # ============================================================
 
 main() {
+  echo "🚀 Starting PostgreSQL Setup with SSL..."
+  
+  # Check if PostgreSQL is installed
+  if ! command -v psql >/dev/null 2>&1; then
+    echo "❌ PostgreSQL is not installed. Please install PostgreSQL first."
+    echo "   Run: sudo apt update && sudo apt install -y postgresql postgresql-contrib"
+    exit 1
+  fi
+  
+  # Check if PostgreSQL cluster exists and get the correct service name
+  CLUSTER_INFO=$(sudo pg_lsclusters | grep -v "^Ver" | head -n1)
+  if [[ -z "$CLUSTER_INFO" ]]; then
+    echo "❌ No PostgreSQL clusters found. Please check your PostgreSQL installation."
+    exit 1
+  fi
+  
+  # Extract version and cluster name from pg_lsclusters output
+  PG_VERSION=$(echo "$CLUSTER_INFO" | awk '{print $1}')
+  PG_CLUSTER=$(echo "$CLUSTER_INFO" | awk '{print $2}')
+  PG_SERVICE="postgresql@${PG_VERSION}-${PG_CLUSTER}"
+  
+  echo "📋 Found PostgreSQL cluster: $PG_VERSION/$PG_CLUSTER (service: $PG_SERVICE)"
+  
+  # Update global variables to use the detected version
+  PG_HBA="/etc/postgresql/${PG_VERSION}/${PG_CLUSTER}/pg_hba.conf"
+  PG_CONF="/etc/postgresql/${PG_VERSION}/${PG_CLUSTER}/postgresql.conf"
+
   load_saved_credentials
 
   if [[ "$USE_SAVED" != "yes" ]]; then
@@ -275,12 +379,20 @@ main() {
 
   verify_hostname_mapping
   update_pg_hba
-  setup_domain_ssl || generate_ssl   # fallback if LE fails
+  
+  # Try Let's Encrypt SSL first, fallback to self-signed if it fails
+  if ! setup_domain_ssl; then
+    echo "⚠️ Let's Encrypt SSL failed, falling back to self-signed certificate..."
+    generate_ssl
+  fi
+  
   create_user_db
   save_credentials
   print_info
   check_port
   test_all_connectivity
+  
+  echo "🎉 PostgreSQL setup completed successfully!"
 }
 
 main "$@"
